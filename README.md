@@ -37,7 +37,7 @@
 ## Установка
 
 ```bash
-git clone git@github.com:Erhan1708/-voice-assistant.git ~/voice-assistant
+git clone git@github.com:Erhan1708/voice-assistant.git ~/voice-assistant
 cd ~/voice-assistant
 
 # окружение (системные пакеты нужны для PyGObject)
@@ -119,3 +119,7 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "[
 - Яркость внешнего монитора работает только при установленном `ddcutil`
 - Модель на 8 млрд параметров иногда ошибается в формулировке ответа
 - Список приложений берётся из установленных `.desktop` файлов
+
+## Лицензия
+
+[MIT](LICENSE)
