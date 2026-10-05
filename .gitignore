@@ -3,3 +3,4 @@ __pycache__/
 voices/
 config.json
 *.wav
+chrome-extension/

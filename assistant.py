@@ -39,6 +39,7 @@ CONFIG = {
     "max_record_sec": 30,
     "volume_step": 10,
     "search_url": "https://www.google.com/search?q={q}",
+    "yandex_music_url": "https://music.yandex.ru",
     "history_sec": 180,           # сколько секунд помнить предыдущие реплики
     "history_turns": 2,           # сколько прошлых обменов помнить (0 отключает память)
 }
@@ -385,6 +386,111 @@ def daemon():
         return {"play": "Воспроизведение включено.", "pause": "Пауза.", "play_pause": "Переключено.",
                 "next": "Следующий трек.", "previous": "Предыдущий трек.", "stop": "Остановлено."}[action]
 
+    # ── плееры (MPRIS) ──
+    def mpris_state():
+        """Список (имя, статус, название, исполнитель) для всех плееров."""
+        b, out = bus(), []
+        try:
+            names = b.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                "ListNames", None, GLib.VariantType("(as)"), 0, 3000, None).unpack()[0]
+        except GLib.Error:
+            return out
+        for n in names:
+            if not n.startswith("org.mpris.MediaPlayer2."):
+                continue
+            try:
+                props = b.call_sync(n, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "GetAll",
+                                    GLib.Variant("(s)", ("org.mpris.MediaPlayer2.Player",)),
+                                    GLib.VariantType("(a{sv})"), 0, 2000, None).unpack()[0]
+            except GLib.Error:
+                continue
+            md = props.get("Metadata") or {}
+            out.append((n, props.get("PlaybackStatus", ""), str(md.get("xesam:title") or ""),
+                        ", ".join(md.get("xesam:artist") or [])))
+        return out
+
+    def pause_all():
+        b, paused = bus(), False
+        for n, status, _, _ in mpris_state():
+            if status == "Playing":
+                try:
+                    b.call_sync(n, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Pause",
+                                None, None, 0, 3000, None)
+                    paused = True
+                except GLib.Error:
+                    pass
+        if paused:
+            time.sleep(0.5)
+
+    def wait_playing(timeout):
+        """Ждёт, пока какой-нибудь плеер начнёт играть. Возвращает название или None."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.7)
+            for _, status, title, artist in mpris_state():
+                if status == "Playing":
+                    return f"{artist} — {title}" if artist and title else (title or "воспроизведение")
+        return None
+
+    def youtube_first(query):
+        """Первое видео из поиска YouTube: (id, название) или (None, None)."""
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+            "Accept-Language": "ru,en;q=0.8", "Cookie": "CONSENT=YES+1; SOCS=CAI"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                page = r.read().decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            log(f"Поиск YouTube не удался: {e!r}")
+            return None, None
+        m = re.search(r'"videoRenderer":\{"videoId":"([\w-]{11})".{0,1500}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', page, re.S)
+        if m:
+            try:
+                title = json.loads(f'"{m.group(2)}"')
+            except ValueError:
+                title = m.group(2)
+            return m.group(1), title
+        m = re.search(r'"videoId":"([\w-]{11})"', page)
+        return (m.group(1), "") if m else (None, None)
+
+    def t_play_youtube(query):
+        q = str(query or "").strip() or "музыка"
+        vid, title = youtube_first(q)
+        if not vid:
+            url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+            spawn_detached(["xdg-open", url], "browser")
+            return "Ошибка: не удалось выбрать видео автоматически. Открыта страница поиска YouTube, включить нужно вручную."
+        pause_all()
+        err = spawn_detached(["xdg-open", f"https://www.youtube.com/watch?v={vid}"], "browser")
+        if err:
+            return f"Ошибка: {err}"
+        name = title or q
+        if wait_playing(15):
+            return f"На YouTube играет: {name}"
+        return f"Видео «{name}» открыто на YouTube, но воспроизведение не началось само. Возможно, браузер заблокировал автозапуск."
+
+    SEARCH_SITES = {
+        "google": "https://www.google.com/search?q={q}",
+        "images": "https://www.google.com/search?tbm=isch&q={q}",
+        "youtube": "https://www.youtube.com/results?search_query={q}",
+        "yandex": "https://yandex.ru/search/?text={q}",
+        "yandex_music": CONFIG["yandex_music_url"].rstrip("/") + "/search?text={q}",
+        "wikipedia": "https://ru.wikipedia.org/w/index.php?search={q}",
+        "maps": "https://www.google.com/maps/search/{q}",
+    }
+
+    def t_search_site(query, site="google"):
+        q = str(query or "").strip()
+        if not q:
+            return "Ошибка: пустой запрос."
+        site = str(site or "google").lower()
+        if site not in SEARCH_SITES:
+            return "Ошибка: site должен быть одним из: " + ", ".join(SEARCH_SITES)
+        url = SEARCH_SITES[site].format(q=urllib.parse.quote_plus(q))
+        err = spawn_detached(["xdg-open", url], "browser")
+        return f"Ошибка: {err}" if err else f"Открыт поиск «{q}» на {site}. Результаты показаны в браузере."
+
     def t_screenshot():
         b = bus()
         token = "va%d" % random.randint(1, 10**9)
@@ -549,7 +655,9 @@ def daemon():
     TOOLSET = [
         tool(t_open_app, "Запустить приложение по названию.", {"name": {**S, "description": "Название из списка установленных приложений"}}, ["name"]),
         tool(t_close_app, "Закрыть запущенное приложение.", {"name": S}, ["name"]),
-        tool(t_open_website, "Открыть сайт в браузере или выполнить поиск в интернете.", {"target": {**S, "description": "Адрес сайта (например youtube.com) или поисковый запрос"}}, ["target"]),
+        tool(t_open_website, "Открыть сайт в браузере по названию или адресу, без поиска.", {"target": {**S, "description": "Адрес сайта, например youtube.com или github.com"}}, ["target"]),
+        tool(t_search_site, "Найти что-то в интернете или на конкретном сайте и показать результаты в браузере.", {"query": {**S, "description": "Что искать"}, "site": {**S, "enum": ["google", "images", "youtube", "yandex", "yandex_music", "wikipedia", "maps"], "description": "Где искать, по умолчанию google"}}, ["query"]),
+        tool(t_play_youtube, "Найти на YouTube и сразу включить музыку, песню, клип или видео по запросу.", {"query": {**S, "description": "Исполнитель, песня, жанр или тема видео"}}, ["query"]),
         tool(t_open_path, "Открыть папку в файловом менеджере или файл в программе по умолчанию.", {"path": {**S, "description": "Путь, например ~/Downloads"}}, ["path"]),
         tool(t_volume, "Управление громкостью звука.", {"action": {**S, "enum": ["set", "up", "down", "mute", "unmute", "get"]}, "value": N}, ["action"]),
         tool(t_brightness, "Управление яркостью монитора.", {"action": {**S, "enum": ["set", "up", "down"]}, "value": N}, ["action"]),
@@ -728,6 +836,8 @@ def daemon():
                 "если инструмент вернул ошибку, так и скажи.\n"
                 "5. Не вызывай один и тот же инструмент повторно с теми же аргументами.\n"
                 "6. Название приложения передавай точно как в списке установленных приложений.\n"
+                "7. Адреса поиска не придумывай: для поиска вызывай search_site, чтобы включить музыку или видео "
+                "на YouTube вызывай play_youtube. Если просят открыть YouTube и поставить музыку, достаточно play_youtube.\n"
                 f"Домашняя папка: ~ ({HOME}). Папки пользователя: {folders}.\n"
                 f"Сейчас {now:%d.%m.%Y %H:%M}, {WEEKDAYS[now.weekday()]}.\n"
                 f"Установленные приложения: {', '.join(apps)}."
